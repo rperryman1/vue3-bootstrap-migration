@@ -24,7 +24,7 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 
 // ─── Bootstrap 4 → 5 classes ─────────────────────────────────────────────────
 
@@ -287,6 +287,7 @@ const sameCase = (orig, kebab) => (/^[A-Z]/.test(orig) ? toPascal(kebab) : kebab
 const bindPrefix = name => (name.startsWith('v-bind:') ? 'v-bind:' : ':');
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const isClassProp = prop => prop === 'class' || prop.endsWith('-class');
+const isComponentTag = name => name === 'component' || /^[A-Z]/.test(name) || name.includes('-');
 // Quote for string literals added to an expression, so the attribute never holds both kinds.
 const litQuote = expr => (expr.includes('"') ? '"' : "'");
 
@@ -512,6 +513,35 @@ function findElementEnd(src, from, name) {
   return null;
 }
 
+const NESTING_SRC = String.raw`<!--[\s\S]*?-->|<\/([A-Za-z][\w.:-]*)\s*>|${TAG_RE.source}`;
+
+// Names of the elements still open at src[index], outermost first.
+function openElements(src, index) {
+  const re = new RegExp(NESTING_SRC, 'g');
+  const stack = [];
+  let m;
+  while ((m = re.exec(src)) && m.index < index) {
+    if (m[1]) {
+      const i = stack.lastIndexOf(m[1]);
+      if (i >= 0) stack.length = i;
+    } else if (m[2] && !m[5] && !VOID_TAGS.has(m[2].toLowerCase())) {
+      stack.push(m[2]);
+    }
+  }
+  return stack;
+}
+
+// Vue 3 takes <template #name> only as a direct child of a component: says why a slot can't go where
+// it is, or returns null.
+function slotProblem(open, name) {
+  const [parent, grand] = [open.at(-1), open.at(-2)];
+  if (parent && isComponentTag(parent)) return null;
+  if (parent === 'template' && grand && isComponentTag(grand)) {
+    return `slot="${name}" sits inside a <template> wrapper: Vue 3 needs it directly under <${grand}>; write <template #${name}> there by hand, moving the wrapper's v-if / v-for onto it.`;
+  }
+  return `slot="${name}" is not on a direct child of a component, so it never filled a slot: delete the attribute, or move the element directly under the component inside <template #${name}>.`;
+}
+
 // Removes src[start, end); when that leaves an empty line, removes the line too.
 function cutRange(src, start, end) {
   const lineStart = src.lastIndexOf('\n', start - 1) + 1;
@@ -562,7 +592,8 @@ function transformTemplate(src, fc) {
   src = unwrapInputGroupAddons(src, fc);
   src = wrapSlotElements(src, fc);
   src = renameClosingTags(src, fc.opts);
-  src = src.replace(TAG_RE, (all, name, attrSrc, trail, self) => processTag(all, name, attrSrc, trail, self === '/', fc));
+  src = src.replace(TAG_RE, (all, name, attrSrc, trail, self, offset, whole) =>
+    processTag(all, name, attrSrc, trail, self === '/', fc, () => openElements(whole, offset)));
   return src.replace(/\{\{([\s\S]*?)\}\}/g, (all, expr) =>
     (hasFilter(expr) ? fc.flag('vue3', 'Vue 3 removed filters ({{ value | filter }}): call a method instead.') : '') + all);
 }
@@ -620,21 +651,26 @@ function unwrapInputGroupAddons(src, fc) {
   return src;
 }
 
-// <div slot="footer" slot-scope="x"> → <template #footer="x"><div>…</div></template>
+// <div slot="footer" slot-scope="x" v-if="y"> → <template v-if="y" #footer="x"><div>…</div></template>.
+// v-if / v-else-if / v-else move to the <template>, so the slot itself stays conditional as in Vue 2.
 function wrapSlotElements(src, fc) {
   const re = new RegExp(TAG_RE.source, 'g');
   let m;
   while ((m = re.exec(src))) {
     const [all, name, attrSrc, trail, self] = m;
     if (name === 'template' || !/\s(:|v-bind:)?slot\s*=/.test(attrSrc)) continue;
+    if (src.lastIndexOf('<!--', m.index) > src.lastIndexOf('-->', m.index)) continue;
     const t = new Tag(name, attrSrc, trail, self === '/');
     const slot = t.live.find(a => a.name === 'slot' && a.value !== undefined);
     const scope = t.live.find(a => a.name === 'slot-scope');
     const bound = t.live.find(a => /^(:|v-bind:)slot$/.test(a.name));
+    const cond = t.live.filter(a => /^v-(if|else-if|else)$/.test(a.name));
     let problem = null;
     if (bound) problem = 'dynamic :slot: use <template #[name]> in Vue 3.';
     else if (!slot) continue;
     else if (!/^[\w$-]+(\([^.\s()]*\))?$/.test(slot.value)) problem = `slot="${slot.value}": wrap it in <template #…> by hand (names with "." need dynamic slot syntax).`;
+    else if (cond.length && t.live.some(a => a.name === 'v-for')) problem = `slot="${slot.value}" with v-for and v-if / v-else: wrap it in <template #${slot.value}> by hand.`;
+    else problem = slotProblem(openElements(src, m.index), slot.value);
     const close = !problem && !self && !VOID_TAGS.has(name.toLowerCase()) ? findElementEnd(src, m.index + all.length, name) : null;
     if (!problem && !self && !VOID_TAGS.has(name.toLowerCase()) && !close) problem = `slot="${slot.value}": no closing tag found; wrap it in <template #${slot.value}> by hand.`;
     if (problem) {
@@ -645,8 +681,9 @@ function wrapSlotElements(src, fc) {
     }
     t.remove(slot);
     if (scope) t.remove(scope);
+    cond.forEach(a => t.remove(a));
     const q = scope?.value.includes('"') ? "'" : '"';
-    const open = `<template #${slot.value}${scope ? `=${q}${scope.value}${q}` : ''}>`;
+    const open = `<template${cond.map(a => ` ${a.raw.trim()}`).join('')} #${slot.value}${scope ? `=${q}${scope.value}${q}` : ''}>`;
     const tag = t.toString();
     if (close) {
       src = src.slice(0, m.index) + open + tag + src.slice(m.index + all.length, close.end) + '</template>' + src.slice(close.end);
@@ -667,8 +704,9 @@ function renameClosingTags(src, opts) {
   return src;
 }
 
-function processTag(all, name, attrSrc, trail, self, fc) {
+function processTag(all, name, attrSrc, trail, self, fc, ancestors) {
   const t = new Tag(name, attrSrc, trail, self);
+  t.ancestors = ancestors;
   const ctx = fc.scoped();
   const kebab = toKebab(name);
   componentRules(t, kebab, ctx);
@@ -677,7 +715,7 @@ function processTag(all, name, attrSrc, trail, self, fc) {
 }
 
 function genericRules(t, ctx) {
-  const isComponent = /^[A-Z]/.test(t.name) || t.name.includes('-');
+  const isComponent = isComponentTag(t.name);
   for (const a of t.live) {
     const info = attrInfo(a.name);
     if (info.kind === 'on' && info.mods.includes('native')) {
@@ -713,10 +751,10 @@ function genericRules(t, ctx) {
   }
   if (t.name === 'template') {
     convertTemplateSlot(t, ctx);
-    // BModal's slots lost their modal- prefix.
+    // BModal's slots lost their modal- prefix. Other components keep their slot names.
     for (const a of t.live) {
       const m = /^(#|v-slot:)modal-(header-close|header|title|footer|ok|cancel)$/.exec(a.name);
-      if (!m) continue;
+      if (!m || toKebab(t.ancestors().at(-1) ?? '') !== 'b-modal') continue;
       a.name = m[1] + m[2];
       a.dirty = true;
       ctx.change('<b-modal> slot modal-* → *');
@@ -745,6 +783,11 @@ function convertTemplateSlot(t, ctx) {
   const name = slot ? slot.value : 'default';
   if (!/^[\w$-]+(\([^.\s()]*\))?$/.test(name)) {
     ctx.flag('slots', `slot="${name}": convert to v-slot by hand (names with "." need dynamic slot syntax).`);
+    return;
+  }
+  const problem = slotProblem(t.ancestors(), name);
+  if (problem) {
+    ctx.flag('slots', problem);
     return;
   }
   const target = slot ?? scope;

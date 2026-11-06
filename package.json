@@ -1,0 +1,11 @@
+{
+  "name": "vue3-bootstrap-migration",
+  "private": true,
+  "description": "BootstrapVue → BootstrapVueNext and Vue 2 → Vue 3 migration scripts. The scripts have no dependencies; the compiler is only used by the tests.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@vue/compiler-dom": "^3.5.13"
+  }
+}
